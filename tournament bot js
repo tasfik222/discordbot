@@ -1,0 +1,217 @@
+import fs from "fs";
+import { Client, GatewayIntentBits, PermissionsBitField } from "discord.js";
+
+// Channel IDs
+const REG_CHANNEL = "";
+const LIST_CHANNEL = "";
+
+// -------------------
+// JSON Persistence
+// -------------------
+function loadJSON(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveJSON(file, data) {
+  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+}
+
+// Persistent data
+let registrations = loadJSON("registrations.json");
+let teamVoiceChannels = loadJSON("channels.json");
+
+// Save all
+function saveAll() {
+  saveJSON("registrations.json", registrations);
+  saveJSON("channels.json", teamVoiceChannels);
+}
+
+// -------------------
+// Discord Client
+// -------------------
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
+});
+
+// -------------------
+// Update Registration List
+// -------------------
+async function updateList(guild) {
+  const listChannel = guild.channels.cache.get(LIST_CHANNEL);
+  if (!listChannel) return;
+
+  const teams = {};
+
+  for (const [uid, info] of Object.entries(registrations)) {
+    const { partnerId, team } = info;
+    if (!teams[team]) teams[team] = [];
+    if (!teams[team].some(p => p.includes(`<@${uid}>`) || p.includes(`<@${partnerId}>`))) {
+      teams[team].push([`<@${uid}>`, `<@${partnerId}>`]);
+    }
+  }
+
+  const sorted = Object.keys(teams).sort();
+  let output = `**📌 Team Registration List**\n\n`;
+
+  for (const team of sorted) {
+    output += `### **${team}**\n`;
+    for (const pair of teams[team]) {
+      output += `${pair[0]}, ${pair[1]}\n`;
+    }
+    output += `\n`;
+  }
+
+  try {
+    const lastMsg = (await listChannel.messages.fetch({ limit: 1 }).catch(() => null))?.first();
+    if (lastMsg) {
+      await lastMsg.edit(output).catch(() => {});
+    } else {
+      await listChannel.send(output);
+    }
+  } catch {}
+}
+
+// -------------------
+// Create Voice Channels
+// -------------------
+async function createTeamVoiceChannels(guild) {
+  let teams = {};
+
+  for (const [uid, info] of Object.entries(registrations)) {
+    const { partnerId, team } = info;
+    if (!teams[team]) teams[team] = new Set();
+    teams[team].add(uid);
+    teams[team].add(partnerId);
+  }
+
+  for (const [teamName, memberSet] of Object.entries(teams)) {
+    let existing = guild.channels.cache.get(teamVoiceChannels[teamName]);
+    if (!existing) {
+      const channel = await guild.channels.create({
+        name: teamName,
+        type: 2, // voice
+        permissionOverwrites: [
+          {
+            id: guild.roles.everyone.id,
+            allow: [PermissionsBitField.Flags.ViewChannel],
+            deny: [PermissionsBitField.Flags.Connect],
+          },
+          ...[...memberSet].map(uid => ({
+            id: uid,
+            allow: [PermissionsBitField.Flags.Connect, PermissionsBitField.Flags.ViewChannel]
+          }))
+        ]
+      });
+      teamVoiceChannels[teamName] = channel.id;
+      saveAll();
+    }
+  }
+}
+
+// -------------------
+// Delete All Voice Channels
+// -------------------
+async function deleteAllVoiceChannels(guild) {
+  for (const id of Object.values(teamVoiceChannels)) {
+    const channel = guild.channels.cache.get(id);
+    if (channel) {
+      await channel.delete().catch(() => {});
+    }
+  }
+  teamVoiceChannels = {};
+  saveAll();
+}
+
+// -------------------
+// Message Handler
+// -------------------
+client.on("messageCreate", async (msg) => {
+  if (msg.author.bot) return;
+  const text = msg.content.trim();
+
+  // Owner commands
+  if (text === "< start") {
+    if (msg.guild.ownerId !== msg.author.id) {
+      return msg.reply("⚠️ শুধুমাত্র Server Owner `< start` ব্যবহার করতে পারবেন!");
+    }
+    await createTeamVoiceChannels(msg.guild);
+    return msg.reply("✅ সব টিমের Voice Channel তৈরি হয়েছে!");
+  }
+
+  if (text === "< stop") {
+    if (msg.guild.ownerId !== msg.author.id) {
+      return msg.reply("⚠️ শুধুমাত্র Server Owner `< stop` ব্যবহার করতে পারবেন!");
+    }
+    registrations = {};
+    await updateList(msg.guild);
+    await deleteAllVoiceChannels(msg.guild);
+    return msg.reply("❌ সব রেজিস্ট্রেশন মুছে ফেলা হয়েছে এবং সব Voice Channel ডিলিট হয়েছে!");
+  }
+
+  // Registration only in REG_CHANNEL
+  if (msg.channel.id !== REG_CHANNEL) return;
+
+  // Delete registration
+  if (text.startsWith("< del")) {
+    if (!registrations[msg.author.id] || registrations[msg.author.id].owner !== msg.author.id) {
+      return msg.reply("⚠️ শুধু যিনি টিম তৈরি করেছেন তিনিই `< del` ব্যবহার করতে পারবেন!");
+    }
+    const partner = registrations[msg.author.id].partnerId;
+    delete registrations[msg.author.id];
+    delete registrations[partner];
+    saveAll();
+    await updateList(msg.guild);
+    return msg.reply("❌ টিম ডিলিট হয়েছে।");
+  }
+
+  // Registration with 2 mentions
+  if (!text.startsWith("<")) return;
+
+  const mentions = msg.mentions.users;
+  if (mentions.size !== 2) {
+    return msg.reply("⚠️ রেজ করতে হলে ২ জনকে mention করতে হবে!");
+  }
+
+  const ids = [...mentions.keys()];
+  const me = msg.author.id;
+
+  if (!ids.includes(me)) {
+    return msg.reply("⚠️ নিজেকে অবশ্যই mention করতে হবে!");
+  }
+
+  const partnerId = ids.find(id => id !== me);
+
+  const match = text.match(/team:\s*(.+)/i);
+  if (!match) {
+    return msg.reply("⚠️ Format: `< @you @teammate team: Team A`");
+  }
+  const team = match[1].trim();
+
+  if (registrations[me] || registrations[partnerId]) {
+    return msg.reply("⚠️ আপনি অথবা আপনার teammate আগে থেকেই কোনো টিমে আছেন!");
+  }
+
+  registrations[me] = { partnerId, team, owner: me };
+  registrations[partnerId] = { partnerId: me, team, owner: me };
+  saveAll();
+  await updateList(msg.guild);
+
+  msg.reply(`✅ Team **${team}** এ সফলভাবে রেজিস্টার হয়েছে!`);
+});
+
+// -------------------
+// Ready Event
+// -------------------
+client.on("ready", () => {
+  console.log(`Bot online: ${client.user.tag}`);
+});
+
+client.login(process.env.TOKEN);
